@@ -9,7 +9,7 @@ use embedded_hal::{
 };
 use embedded_hal_02::adc::Channel;
 use fugit::{Duration, ExtU32};
-use heapless::Vec;
+use heapless::{String, Vec};
 use panic_probe as _;
 use rand_core::RngCore;
 
@@ -68,7 +68,7 @@ impl<PIN: Channel<ADC1, ID = u8>> RngCore for RandomFromNoise<PIN> {
 }
 
 /// Represents signal duration
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Signal {
     Short,
     Long,
@@ -97,11 +97,12 @@ impl Signal {
     }
 }
 
-impl From<bool> for Signal {
-    fn from(value: bool) -> Self {
-        match value {
-            false => Signal::Short,
-            true => Signal::Long,
+impl From<u32> for Signal {
+    fn from(value: u32) -> Self {
+        match value % 2 {
+            0 => Signal::Short,
+            1 => Signal::Long,
+            _ => unreachable!(),
         }
     }
 }
@@ -115,17 +116,124 @@ impl From<&Signal> for char {
     }
 }
 
-trait Parity {
-    fn is_even(&self) -> bool;
-    fn is_odd(&self) -> bool;
+#[derive(Debug, PartialEq)]
+enum GameResult {
+    Correct,
+    Incorrect,
 }
-impl Parity for u32 {
-    fn is_even(&self) -> bool {
-        self % 2 == 0
+
+impl From<bool> for GameResult {
+    fn from(value: bool) -> Self {
+        match value {
+            true => GameResult::Correct,
+            false => GameResult::Incorrect,
+        }
+    }
+}
+
+struct MemoryGame<
+    const TIMER_HZ: u32,
+    Random: RngCore,
+    Delay: DelayNs,
+    Led: OutputPin,
+    Button: InputPin,
+    Timer: fugit_timer::Timer<TIMER_HZ>,
+> {
+    led: Led,
+    button: Button,
+    delay: Delay,
+    random: Random,
+    timer: Timer,
+
+    level: u8,
+    state: Vec<Signal, 64>,
+}
+
+impl<
+        const TIMER_HZ: u32,
+        Random: RngCore,
+        Delay: DelayNs,
+        Led: OutputPin,
+        Button: InputPin,
+        Timer: fugit_timer::Timer<TIMER_HZ>,
+    > MemoryGame<TIMER_HZ, Random, Delay, Led, Button, Timer>
+{
+    pub fn new(led: Led, button: Button, delay: Delay, random: Random, timer: Timer) -> Self {
+        let mut g = Self {
+            led,
+            button,
+            delay,
+            random,
+            timer,
+            level: 0,
+            state: Vec::new(),
+        };
+
+        g.new_game();
+
+        g
     }
 
-    fn is_odd(&self) -> bool {
-        self % 2 == 1
+    pub fn play(&mut self) -> GameResult {
+        let mut guesses: Vec<Signal, 64> = Vec::new();
+        let debug_string: String<64> = self.state.iter().map(char::from).collect();
+        for signal in self.state.iter() {
+            Self::blink_signal(&mut self.led, &mut self.delay, signal)
+        }
+
+        debug!("Current combination: {}", debug_string);
+
+        while guesses.len() < self.state.len() {
+            let signal = self.read_signal();
+            let Some(signal) = signal else {
+                continue;
+            };
+            guesses.push(signal).unwrap();
+        }
+        let debug_string: String<64> = self.state.iter().map(char::from).collect();
+        debug!("Guessed combination: {}", debug_string);
+
+        (guesses == self.state).into()
+    }
+
+    pub fn advance(&mut self) -> u8 {
+        self.level += 1;
+        let new_signal = self.generate_next_signal();
+        self.state.push(new_signal).unwrap();
+
+        self.level
+    }
+
+    pub fn new_game(&mut self) {
+        self.level = 1;
+        let new_signal = self.generate_next_signal();
+        self.state.clear();
+        self.state.push(new_signal).unwrap();
+    }
+
+    fn generate_next_signal(&mut self) -> Signal {
+        Signal::from(self.random.next_u32())
+    }
+
+    // To avoid borrowing self as mutable and immutable reference during iterating over signal array
+    fn blink_signal(led: &mut Led, delay: &mut Delay, signal: &Signal) {
+        led.set_high().unwrap();
+        match signal {
+            Signal::Long => delay.delay_ms(2000),
+            Signal::Short => delay.delay_ms(500),
+        }
+        led.set_low().unwrap();
+        delay.delay_ms(250);
+    }
+
+    fn read_signal(&mut self) -> Option<Signal> {
+        while self.button.is_low().unwrap() {}
+        self.timer.start(1.hours()).unwrap();
+        while self.button.is_high().unwrap() {}
+        let duration = self.timer.now();
+        info!("Time: {}", duration);
+        self.timer.cancel().unwrap();
+        Signal::from_duration(duration.duration_since_epoch())
     }
 }
 
@@ -139,77 +247,24 @@ fn main() -> ! {
 
     let rcc = dp.RCC.constrain();
     let clocks = rcc.cfgr.sysclk(48.MHz()).freeze();
-    let mut delay = cp.SYST.delay(&clocks);
-    let mut timer = dp.TIM2.counter_ms(&clocks);
+    let delay = cp.SYST.delay(&clocks);
+    let timer = dp.TIM2.counter_ms(&clocks);
 
     let adc: Adc<ADC1> = Adc::adc1(dp.ADC1, false, AdcConfig::default());
     let analog_pin = gpiob.pb0.into_analog();
-    let mut rng = RandomFromNoise::new(adc, analog_pin);
+    let rng = RandomFromNoise::new(adc, analog_pin);
 
-    let mut led = gpiob.pb7.into_push_pull_output();
-    let mut button = gpioc.pc13.into_pull_down_input();
+    let led = gpiob.pb7.into_push_pull_output();
+    let button = gpioc.pc13.into_pull_down_input();
 
-    let mut level = 1;
-    let mut chain = Vec::<Signal, 64>::new();
-
+    let mut game = MemoryGame::new(led, button, delay, rng, timer);
     loop {
-        let mut guesses = 0;
-        info!("Level {}", level);
-        let mut answer = Vec::<Signal, 64>::new();
-        debug!("Generated chain: {}", chain);
-        chain
-            .iter()
-            .for_each(|signal| blink_signal(&mut led, &mut delay, signal));
-        while guesses < chain.len() {
-            let signal = read_signal(&mut button, &mut timer);
-            let Some(signal) = signal else {
-                continue;
-            };
-            answer.push(signal).unwrap();
-            guesses += 1;
-        }
-        debug!("Answered chain: {}", answer);
-        if answer == chain {
-            info!("Level completed!");
-            chain.push(generate_next_signal(&mut rng)).unwrap();
-            level += 1;
+        if game.play() == GameResult::Correct {
+            let level = game.advance();
+            info!("Correct! Next level: {}", level);
         } else {
-            info!("Level failed! Expected chain: {}", chain);
-            info!("New game!");
-            chain.clear();
-            chain.push(generate_next_signal(&mut rng)).unwrap();
-            level = 1;
+            info!("Incorrect! Starting new game.");
+            game.new_game();
         }
     }
-}
-
-fn generate_next_signal<R: RngCore>(rnd: &mut R) -> Signal {
-    Signal::from(rnd.next_u32().is_odd())
-}
-
-fn blink_signal<Pin: OutputPin, Delayer: DelayNs>(
-    p: &mut Pin,
-    delay: &mut Delayer,
-    signal: &Signal,
-) {
-    p.set_high().unwrap();
-    match signal {
-        Signal::Long => delay.delay_ms(2000),
-        Signal::Short => delay.delay_ms(500),
-    }
-    p.set_low().unwrap();
-    delay.delay_ms(250);
-}
-
-fn read_signal<const TIMER_HZ: u32, Pin: InputPin, Timer: fugit_timer::Timer<TIMER_HZ>>(
-    p: &mut Pin,
-    t: &mut Timer,
-) -> Option<Signal> {
-    while p.is_low().unwrap() {}
-    t.start(1.hours()).unwrap();
-    while p.is_high().unwrap() {}
-    let duration = t.now();
-    info!("Time: {}", duration);
-    t.cancel().unwrap();
-    Signal::from_duration(duration.duration_since_epoch())
 }
