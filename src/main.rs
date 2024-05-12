@@ -131,6 +131,12 @@ impl From<bool> for GameResult {
     }
 }
 
+trait Game {
+    fn new_game(&mut self);
+    fn advance(&mut self) -> u8;
+    fn play(&mut self) -> GameResult;
+}
+
 struct MemoryGame<
     const TIMER_HZ: u32,
     Random: RngCore,
@@ -147,6 +153,53 @@ struct MemoryGame<
 
     level: u8,
     state: Vec<Signal, 64>,
+}
+
+impl<
+        const TIMER_HZ: u32,
+        Random: RngCore,
+        Delay: DelayNs,
+        Led: OutputPin,
+        Button: InputPin,
+        Timer: fugit_timer::Timer<TIMER_HZ>,
+    > Game for MemoryGame<TIMER_HZ, Random, Delay, Led, Button, Timer>
+{
+    fn play(&mut self) -> GameResult {
+        let mut guesses: Vec<Signal, 64> = Vec::new();
+        let debug_string: String<64> = self.state.iter().map(char::from).collect();
+        for signal in self.state.iter() {
+            Self::blink_signal(&mut self.led, &mut self.delay, signal)
+        }
+
+        debug!("Current combination: {}", debug_string);
+
+        while guesses.len() < self.state.len() {
+            let signal = self.read_signal();
+            let Some(signal) = signal else {
+                continue;
+            };
+            guesses.push(signal).unwrap();
+        }
+        let debug_string: String<64> = self.state.iter().map(char::from).collect();
+        debug!("Guessed combination: {}", debug_string);
+
+        (guesses == self.state).into()
+    }
+
+    fn advance(&mut self) -> u8 {
+        self.level += 1;
+        let new_signal = self.generate_next_signal();
+        self.state.push(new_signal).unwrap();
+
+        self.level
+    }
+
+    fn new_game(&mut self) {
+        self.level = 1;
+        let new_signal = self.generate_next_signal();
+        self.state.clear();
+        self.state.push(new_signal).unwrap();
+    }
 }
 
 impl<
@@ -174,43 +227,6 @@ impl<
         g
     }
 
-    pub fn play(&mut self) -> GameResult {
-        let mut guesses: Vec<Signal, 64> = Vec::new();
-        let debug_string: String<64> = self.state.iter().map(char::from).collect();
-        for signal in self.state.iter() {
-            Self::blink_signal(&mut self.led, &mut self.delay, signal)
-        }
-
-        debug!("Current combination: {}", debug_string);
-
-        while guesses.len() < self.state.len() {
-            let signal = self.read_signal();
-            let Some(signal) = signal else {
-                continue;
-            };
-            guesses.push(signal).unwrap();
-        }
-        let debug_string: String<64> = self.state.iter().map(char::from).collect();
-        debug!("Guessed combination: {}", debug_string);
-
-        (guesses == self.state).into()
-    }
-
-    pub fn advance(&mut self) -> u8 {
-        self.level += 1;
-        let new_signal = self.generate_next_signal();
-        self.state.push(new_signal).unwrap();
-
-        self.level
-    }
-
-    pub fn new_game(&mut self) {
-        self.level = 1;
-        let new_signal = self.generate_next_signal();
-        self.state.clear();
-        self.state.push(new_signal).unwrap();
-    }
-
     fn generate_next_signal(&mut self) -> Signal {
         Signal::from(self.random.next_u32())
     }
@@ -227,9 +243,16 @@ impl<
     }
 
     fn read_signal(&mut self) -> Option<Signal> {
+        self.led.set_low().unwrap();
         while self.button.is_low().unwrap() {}
         self.timer.start(1.hours()).unwrap();
-        while self.button.is_high().unwrap() {}
+        let mut high = false;
+        while self.button.is_high().unwrap() {
+            if !high && self.timer.now().duration_since_epoch() > Duration::<u32, 1, TIMER_HZ>::secs(2) {
+                self.led.set_high().unwrap();
+                high = true;
+            }
+        }
         let duration = self.timer.now();
         info!("Time: {}", duration);
         self.timer.cancel().unwrap();
@@ -259,12 +282,15 @@ fn main() -> ! {
 
     let mut game = MemoryGame::new(led, button, delay, rng, timer);
     loop {
-        if game.play() == GameResult::Correct {
-            let level = game.advance();
-            info!("Correct! Next level: {}", level);
-        } else {
-            info!("Incorrect! Starting new game.");
-            game.new_game();
+        match game.play() {
+            GameResult::Correct => {
+                let level = game.advance();
+                info!("Correct! Next level: {}", level);
+            }
+            GameResult::Incorrect => {
+                info!("Incorrect! Starting new game.");
+                game.new_game();
+            }
         }
     }
 }
